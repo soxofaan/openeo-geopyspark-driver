@@ -1,10 +1,11 @@
 from unittest import TestCase
 
+from openeogeotrellis.backend import GpsBatchJobManagement
+
 
 class TestBatchJob(TestCase):
 
     def test_parse_yarn(self):
-        from openeogeotrellis import _extract_application_id
         yarn_log = """
         19/07/10 15:56:39 WARN DomainSocketFactory: The short-circuit local reads feature cannot be used because libhadoop cannot be loaded.
 19/07/10 15:56:39 INFO Client: Attempting to login to the Kerberos using principal: jenkins@VGT.VITO.BE and keytab: jenkins.keytab-2322e03c-bf97-4f59-b9ad-7c2ecb2d1c70
@@ -144,4 +145,5 @@ class TestBatchJob(TestCase):
 19/07/10 15:58:19 INFO Client: Application report for application_1562328661428_5542 (state: RUNNING)
 19/07/10 15:58:20 INFO Client: Application report for application_1562328661428_5542 (state: RUNNING)
         """
-        self.assertEquals("application_1562328661428_5542",_extract_application_id(yarn_log))
+        app_id = GpsBatchJobManagement._extract_application_id(yarn_log)
+        assert app_id == "application_1562328661428_5542"

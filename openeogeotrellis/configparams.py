@@ -16,3 +16,5 @@ class ConfigParams:
         self.layer_catalog_metadata_files = env.get("OPENEO_CATALOG_FILES", "layercatalog.json").split(",")
 
         self.require_bounds = env.get("OPENEO_REQUIRE_BOUNDS") != "False"
+
+        self.output_dir_root = env.get("OPENEO_OUTPUT_DIR_ROOT", "/data/projects/OpenEO/")

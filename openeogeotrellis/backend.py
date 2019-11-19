@@ -1,15 +1,26 @@
+import logging
+import os
+import pathlib
+import re
+import subprocess
+import uuid
 from typing import List
 
+import geopyspark as gps
+import pkg_resources
+from geopyspark import TiledRasterLayer, LayerType
+from py4j.java_gateway import JavaGateway
+
 from openeo_driver import backend
+from openeo_driver.errors import JobNotFinishedException
 from openeogeotrellis import ConfigParams
+from openeogeotrellis.GeotrellisImageCollection import GeotrellisTimeSeriesImageCollection
+from openeogeotrellis.job_registry import JobRegistry, JobNotFoundException
 from openeogeotrellis.layercatalog import get_layer_catalog
 from openeogeotrellis.service_registry import InMemoryServiceRegistry, ZooKeeperServiceRegistry
 from openeogeotrellis.utils import kerberos, normalize_date
-from openeogeotrellis.GeotrellisImageCollection import GeotrellisTimeSeriesImageCollection
 
-from py4j.java_gateway import JavaGateway
-import geopyspark as gps
-from geopyspark import TiledRasterLayer, LayerType
+logger = logging.getLogger("openeo-geopyspark-driver")
 
 
 def _merge(original: dict, key, value) -> dict:
@@ -67,6 +78,125 @@ class GpsSecondaryServices(backend.SecondaryServices):
         self.service_registry.stop_service(service_id)
 
 
+class GpsBatchJobManagement(backend.BatchJobManagement):
+    def __init__(self, job_registry: JobRegistry):
+        super().__init__()
+        self.job_registry = job_registry
+        self._output_dir = ConfigParams().output_dir_root
+
+    def create_job(self, user_id: str, api_version: str, job_specification: dict) -> str:
+        job_id = str(uuid.uuid4())
+
+        with self.job_registry as registry:
+            registry.register(job_id, user_id, api_version, job_specification)
+
+        return job_id
+
+    def start_job(self, job_id: str, user_id: str) -> None:
+        # TODO deprecated
+        from pyspark import SparkContext
+
+        with self.job_registry as registry:
+            job_info = registry.get_job(job_id, user_id)
+            api_version = job_info.get('api_version')
+
+            # FIXME: mark_undone in case of re-queue
+
+            kerberos()
+
+            output_dir = pathlib.Path(self.get_result_output_dir(job_id=job_id, user_id=user_id))
+            output_dir.mkdir(exist_ok=True)
+            input_file = output_dir / "in"
+            output_file = output_dir / "out"
+
+            with input_file.open('w') as f:
+                f.write(job_info['specification'])
+
+            conf = SparkContext.getOrCreate().getConf()
+            principal, key_tab = conf.get("spark.yarn.principal"), conf.get("spark.yarn.keytab")
+
+            script_location = pkg_resources.resource_filename('openeogeotrellis.deploy', 'submit_batch_job.sh')
+
+            args = [
+                script_location,
+                "OpenEO batch job {j} user {u}".format(j=job_id, u=user_id),
+                str(input_file),
+                str(output_file),
+            ]
+            if principal is not None and key_tab is not None:
+                args.append(principal)
+                args.append(key_tab)
+            else:
+                args.append("no_principal")
+                args.append("no_keytab")
+            if api_version:
+                args.append(api_version)
+
+            try:
+                logger.info("Executing {a}".format(a=args))
+                output_string = subprocess.check_output(args, stderr=subprocess.STDOUT, universal_newlines=True)
+            except subprocess.CalledProcessError as e:
+                logger.exception(e)
+                logger.error("stdout:")
+                logger.error(e.stdout)
+                logger.error("stderr:")
+                logger.error(e.stderr)
+                raise e
+
+            # note: a job_id is returned as soon as an application ID is found in stderr, not when the job is finished
+            logger.debug(output_string)
+            application_id = self._extract_application_id(output_string)
+            print("mapped job_id %s to application ID %s" % (job_id, application_id))
+
+            registry.set_application_id(job_id, user_id, application_id)
+
+    @staticmethod
+    def _extract_application_id(log) -> str:
+        match = re.search(r"^.*Application report for (application_\d{13}_\d+)\s\(state:.*", log, re.MULTILINE)
+        if not match:
+            raise ValueError("Failed to extract application id from log")
+        return match.group(1)
+
+    def cancel_job(self, job_id: str, user_id: str):
+        with self.job_registry as registry:
+            application_id = registry.get_job(job_id, user_id)['application_id']
+        subprocess.call(["yarn", "application", "-kill", application_id])
+        # TODO check result of subprocess
+
+    def get_job_info(self, job_id: str, user_id: str) -> dict:
+        """Returns detailed information about a submitted batch job,
+        or None if the batch job with this job_id is unknown."""
+        with self.job_registry as registry:
+            status = registry.get_job(job_id, user_id)['status']
+
+        return {
+            # TODO: see https://open-eo.github.io/openeo-api/apireference/#tag/Batch-Job-Management/paths/~1jobs~1{job_id}/get
+            'id': job_id,
+            'job_id': job_id,  # TODO deprecated
+            'status': status
+        }
+
+    def get_jobs_info(self, user_id: str) -> List[dict]:
+        with self.job_registry as registry:
+            return [{
+                'id': job_info['job_id'],
+                'status': job_info['status'],
+                # TODO: more job info: see https://open-eo.github.io/openeo-api/apireference/#tag/Batch-Job-Management/paths/~1jobs~1{job_id}/get
+                # required: process_graph, submitted
+                # optional: title, description, progress
+            } for job_info in registry.get_user_jobs(user_id)]
+
+    def get_result_filenames(self, job_id: str, user_id: str) -> List[str]:
+        job_info = self.get_job_info(job_id, user_id)
+        if job_info["status"] != "finished":
+            raise JobNotFinishedException
+        return ["out"]
+
+    def get_result_output_dir(self, job_id: str, user_id: str) -> str:
+        # TODO also use user_id?
+        return os.path.join(self._output_dir, job_id)
+
+
 class GeoPySparkBackendImplementation(backend.OpenEoBackendImplementation):
 
     def __init__(self):
@@ -75,10 +205,12 @@ class GeoPySparkBackendImplementation(backend.OpenEoBackendImplementation):
             InMemoryServiceRegistry() if ConfigParams().is_ci_context
             else ZooKeeperServiceRegistry()
         )
+        job_registry = JobRegistry()
 
         super().__init__(
             secondary_services=GpsSecondaryServices(service_registry=self._service_registry),
             catalog=get_layer_catalog(service_registry=self._service_registry),
+            batch_job_management=GpsBatchJobManagement(job_registry=job_registry),
         )
 
     def health_check(self) -> str:

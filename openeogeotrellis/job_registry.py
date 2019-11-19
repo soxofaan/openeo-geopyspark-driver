@@ -1,14 +1,11 @@
+import json
 from typing import List, Dict
+
 from kazoo.client import KazooClient
 from kazoo.exceptions import NoNodeError
-import json
 
+from openeo_driver.errors import JobNotFoundException
 from openeogeotrellis.configparams import ConfigParams
-
-
-class JobNotFoundException(ValueError):
-    def __init__(self, message):
-        super().__init__(message)
 
 
 class JobRegistry:
@@ -76,7 +73,6 @@ class JobRegistry:
 
     def get_job(self, job_id: str, user_id: str) -> Dict:
         """Returns details of a job."""
-
         job_info, _ = self._read(job_id, user_id, include_done=True)
         return job_info
 
@@ -124,7 +120,7 @@ class JobRegistry:
                 path = self._done(user_id, job_id)
                 data, stat = self._zk.get(path)
             else:
-                raise JobNotFoundException(job_id)
+                raise JobNotFoundException(job_id=job_id)
 
         return json.loads(data.decode()), stat.version
 
